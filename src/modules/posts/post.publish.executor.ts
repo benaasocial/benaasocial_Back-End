@@ -188,11 +188,13 @@ async function publishTikTok(params: {
    * TikTok settings are controlled by the frontend.
    * Values are used exactly as sent from the frontend when available.
    */
-  const privacyLevel = tiktokSettings?.privacy_level ?? "SELF_ONLY";
-  const disableComment = tiktokSettings?.disable_comment ?? false;
-  const disableDuet = tiktokSettings?.disable_duet ?? false;
-  const disableStitch = tiktokSettings?.disable_stitch ?? false;
 
+
+  const privacyLevel = tiktokSettings?.privacyStatus ?? "SELF_ONLY";
+  const disableComment = tiktokSettings?.allowComments ?? false;
+  const disableDuet = tiktokSettings?.allowDuet ?? false;
+  const disableStitch = tiktokSettings?.allowStitch ?? false;
+  console.log(privacyLevel);
   if (!videoUrl) {
     failPlatform(post, "tiktok", "Video url is missing");
     return;
