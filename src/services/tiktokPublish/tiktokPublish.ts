@@ -150,10 +150,24 @@ export async function publishTikTokVideo({
   accessToken: string;
   videoUrl: string;
   caption: string;
+
+  /**
+   * TikTok privacy level selected from the frontend.
+   * If not provided, backend will fallback to SELF_ONLY.
+   */
   privacy_level?: "PUBLIC_TO_EVERYONE" | "MUTUAL_FOLLOW_FRIENDS" | "SELF_ONLY";
+
+  /**
+   * TikTok interaction settings selected from the frontend.
+   */
   disable_comment?: boolean;
   disable_duet?: boolean;
   disable_stitch?: boolean;
+
+  /**
+   * Backend safety override.
+   * If true, privacy will always be SELF_ONLY regardless of frontend value.
+   */
   forcePrivate?: boolean;
 }) {
   let filePath: string | null = null;
@@ -161,29 +175,35 @@ export async function publishTikTokVideo({
 
   try {
     /**
-     * Step 1: Download video locally
+     * Step 1: Download video locally.
      */
     const { filePath: tempPath, fileSize } = await downloadVideo(videoUrl);
     filePath = tempPath;
 
     /**
-     * Step 2: Calculate chunking strategy
+     * Step 2: Calculate chunking strategy.
      */
     const chunkSize = fileSize <= 5 * 1024 * 1024 ? fileSize : CHUNK_SIZE;
     const totalChunks = Math.ceil(fileSize / chunkSize);
 
     /**
-     * Privacy handling:
-     * - If forcePrivate = true → override everything to SELF_ONLY
-     * - Otherwise → use provided privacy_level
-     * - Default fallback → PUBLIC
+     * TikTok privacy handling.
+     * - If forcePrivate is true, force SELF_ONLY.
+     * - Otherwise, use the value selected from the frontend.
+     * - If frontend did not send privacy_level, fallback to SELF_ONLY.
      */
-    const privacy = forcePrivate
-      ? "SELF_ONLY"
-      : (privacy_level ?? "SELF_ONLY");
+    const privacy = forcePrivate ? "SELF_ONLY" : privacy_level ?? "SELF_ONLY";
 
     /**
-     * Step 3: Initialize TikTok upload session
+     * TikTok interaction settings.
+     * These values come from the frontend.
+     */
+    const allowCommentDisabled = Boolean(disable_comment);
+    const allowDuetDisabled = Boolean(disable_duet);
+    const allowStitchDisabled = Boolean(disable_stitch);
+
+    /**
+     * Step 3: Initialize TikTok upload session.
      */
     const initRes = await fetch(
       "https://open.tiktokapis.com/v2/post/publish/video/init/",
@@ -197,9 +217,9 @@ export async function publishTikTokVideo({
           post_info: {
             title: (caption || "").trim().slice(0, 2200),
             privacy_level: privacy,
-            disable_comment,
-            disable_duet,
-            disable_stitch,
+            disable_comment: allowCommentDisabled,
+            disable_duet: allowDuetDisabled,
+            disable_stitch: allowStitchDisabled,
           },
           source_info: {
             source: "FILE_UPLOAD",
@@ -225,7 +245,6 @@ export async function publishTikTokVideo({
         }
       );
     }
-    
 
     const uploadUrl = initBody?.data?.upload_url;
     const publishId = initBody?.data?.publish_id;
@@ -243,7 +262,7 @@ export async function publishTikTokVideo({
     }
 
     /**
-     * Step 4: Upload video in chunks
+     * Step 4: Upload video in chunks.
      */
     fileHandle = await fs.promises.open(filePath, "r");
 
@@ -289,25 +308,21 @@ export async function publishTikTokVideo({
     }
 
     /**
-     * Return publish id (used later to track status)
+     * Return publish id.
+     * Used later to track TikTok publishing status.
      */
     return { publish_id: publishId };
-
   } catch (error: any) {
     if (error instanceof AppError) throw error;
 
-    throw createError(
-      "TikTok upload failed",
-      502,
-      "TIKTOK_UNEXPECTED",
-      { errorMessage: error?.message }
-    );
-
+    throw createError("TikTok upload failed", 502, "TIKTOK_UNEXPECTED", {
+      errorMessage: error?.message,
+    });
   } finally {
     /**
      * Cleanup resources:
-     * - Close file handle
-     * - Delete temp file
+     * - Close file handle.
+     * - Delete temp file.
      */
     try {
       if (fileHandle) await fileHandle.close();

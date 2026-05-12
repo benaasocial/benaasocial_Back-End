@@ -175,6 +175,11 @@ const PostSchema = new Schema(
       youtube: { type: Boolean, default: false },
     },
 
+    tiktokSettings: {
+      type: Schema.Types.Mixed,
+      default: undefined,
+    },
+
     /**
      * publishResults:
      * Always exists so you can update per-platform status independently.

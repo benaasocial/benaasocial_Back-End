@@ -175,13 +175,19 @@ async function publishTikTok(params: {
 }) {
   const { post, byPlatform, message, media, tiktokSettings } = params;
 
-  // Skip if TikTok is not selected or media is not a video
+  /**
+   * Skip TikTok publishing if:
+   * - TikTok is not selected.
+   * - Media is not a video.
+   */
   if (media.kind !== "video" || !byPlatform.has("tiktok")) return;
 
   const videoUrl = media?.video?.url;
 
-  // Backend defaults:
-  // If no settings are provided, publish publicly by default.
+  /**
+   * TikTok settings are controlled by the frontend.
+   * Values are used exactly as sent from the frontend when available.
+   */
   const privacyLevel = tiktokSettings?.privacy_level ?? "SELF_ONLY";
   const disableComment = tiktokSettings?.disable_comment ?? false;
   const disableDuet = tiktokSettings?.disable_duet ?? false;
@@ -200,6 +206,9 @@ async function publishTikTok(params: {
       accountId: String(acc._id),
     });
 
+    /**
+     * Publish TikTok video using the frontend-selected settings.
+     */
     const result = await publishTikTokVideo({
       accessToken,
       videoUrl,
@@ -319,7 +328,7 @@ export async function executePublishing(params: {
   } = params;
 
   /**
-   * Build a filtered map of only connected platforms
+   * Build a filtered map of only connected platforms.
    */
   const runnableMap = new Map<Platform, any>();
 
@@ -330,23 +339,38 @@ export async function executePublishing(params: {
   }
 
   /**
-   * Execute publishing sequentially
-   * (can be parallelized later if needed)
+   * TikTok settings should come from the frontend.
+   * If params.tiktokSettings is not provided, fallback to post.tiktokSettings.
+   */
+  const finalTikTokSettings = tiktokSettings ?? post?.tiktokSettings;
+
+  /**
+   * YouTube settings should come from the frontend.
+   * If params.youtubeSettings is not provided, fallback to post.youtubeSettings.
+   */
+  const finalYouTubeSettings = youtubeSettings ?? post?.youtubeSettings;
+
+  /**
+   * Execute publishing sequentially.
+   * Can be parallelized later if needed.
    */
   await publishFacebook({ post, byPlatform: runnableMap, message, media });
+
   await publishInstagram({ post, byPlatform: runnableMap, message, media });
+
   await publishTikTok({
     post,
     byPlatform: runnableMap,
     message,
     media,
-    tiktokSettings,
+    tiktokSettings: finalTikTokSettings,
   });
+
   await publishYouTube({
     post,
     byPlatform: runnableMap,
     message,
     media,
-    youtubeSettings,
+    youtubeSettings: finalYouTubeSettings,
   });
 }

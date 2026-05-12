@@ -9,7 +9,17 @@ export type PostStatus =
   | "partial"
   | "failed";
 
+export type TikTokPrivacyLevel =
+  | "PUBLIC_TO_EVERYONE"
+  | "MUTUAL_FOLLOW_FRIENDS"
+  | "SELF_ONLY";
 
+export type TikTokSettings = {
+  privacy_level: TikTokPrivacyLevel;
+  disable_comment: boolean;
+  disable_duet: boolean;
+  disable_stitch: boolean;
+};
 
 export type CreatePostServiceInput = {
   userId: string;
@@ -18,7 +28,7 @@ export type CreatePostServiceInput = {
   hashtags?: any;
   targets?: Record<string, boolean>;
   media: any;
-  tiktokSettings?: any;
+  tiktokSettings?: TikTokSettings;
   youtubeSettings?: any;
 };
 

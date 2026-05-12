@@ -80,6 +80,7 @@ export async function publishPost(
     hashtags: hashtagsArr,
     targets,
     media,
+    tiktokSettings: targets?.tiktok ? tiktokSettings : undefined,
   });
 
   // create publish results
