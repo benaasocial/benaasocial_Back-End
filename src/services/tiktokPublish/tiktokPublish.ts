@@ -93,7 +93,7 @@ async function downloadVideo(videoUrl: string) {
   }).catch((e) => {
     try {
       if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    } catch {}
+    } catch { }
 
     throw createError(
       "Failed while downloading video stream",
@@ -155,7 +155,11 @@ export async function publishTikTokVideo({
    * TikTok privacy level selected from the frontend.
    * If not provided, backend will fallback to SELF_ONLY.
    */
-  privacy_level?: "PUBLIC_TO_EVERYONE" | "MUTUAL_FOLLOW_FRIENDS" | "SELF_ONLY";
+  privacy_level?:
+  | "PUBLIC_TO_EVERYONE"
+  | "MUTUAL_FOLLOW_FRIENDS"
+  | "FOLLOWER_OF_CREATOR"
+  | "SELF_ONLY";
 
   /**
    * TikTok interaction settings selected from the frontend.
@@ -326,10 +330,10 @@ export async function publishTikTokVideo({
      */
     try {
       if (fileHandle) await fileHandle.close();
-    } catch {}
+    } catch { }
 
     try {
       if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    } catch {}
+    } catch { }
   }
 }

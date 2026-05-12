@@ -190,11 +190,26 @@ async function publishTikTok(params: {
    */
 
 
-  const privacyLevel = tiktokSettings?.privacyStatus ?? "SELF_ONLY";
-  const disableComment = tiktokSettings?.allowComments ?? false;
-  const disableDuet = tiktokSettings?.allowDuet ?? false;
-  const disableStitch = tiktokSettings?.allowStitch ?? false;
-  console.log(privacyLevel);
+const privacyLevel =
+  tiktokSettings?.privacyStatus ??
+  tiktokSettings?.privacy_level ??
+  "SELF_ONLY";
+
+const disableComment =
+  typeof tiktokSettings?.disable_comment === "boolean"
+    ? tiktokSettings.disable_comment
+    : !(tiktokSettings?.allowComments ?? true);
+
+const disableDuet =
+  typeof tiktokSettings?.disable_duet === "boolean"
+    ? tiktokSettings.disable_duet
+    : !(tiktokSettings?.allowDuet ?? true);
+
+const disableStitch =
+  typeof tiktokSettings?.disable_stitch === "boolean"
+    ? tiktokSettings.disable_stitch
+    : !(tiktokSettings?.allowStitch ?? true);
+
   if (!videoUrl) {
     failPlatform(post, "tiktok", "Video url is missing");
     return;
