@@ -12,6 +12,9 @@ import {
   retryPostPublishing,
 } from "./post.publish.service";
 import { deletePostMediaFromCloudinary } from "../../utils/DeleteFromCloudinary";
+import { ConnectedAccount } from "../integrations/ConnectedAccount";
+import { getValidTikTokAccessToken } from "./post.tiktok.token";
+import { getTikTokCreatorInfo } from "../../services/tiktokPublish/tiktokCreatorInfo";
 
 export const createPost = async (
   req: AuthenticatedRequest,
@@ -190,6 +193,52 @@ export const getAllPosts = async (
 
 
 
+export const getTikTokCreatorInfoController = async (
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+) => {
+
+    const userId = req.user?._id;
+
+    if (!userId) {
+      return next(new AppError("Unauthorized", 401));
+    }
+
+    const account = await ConnectedAccount.findOne({
+      userId: userId,
+      platform: "tiktok",
+      isActive: true,
+    });
+
+
+    if (!account) {
+      return next(new AppError("TikTok account is not connected", 404));
+    }
+
+    const accessToken = await getValidTikTokAccessToken({
+      userId: String(userId),
+      accountId: String(account._id),
+    });
+
+    const creatorInfo = await getTikTokCreatorInfo(accessToken);
+
+    return sendSuccess(
+      req,
+      res,
+      creatorInfo,
+      200,
+      "TikTok creator info fetched successfully"
+    );
+};
+
+
+
+
+
+
+
+
 /**
  * ============================================================
  * Delete Post Controller
@@ -205,35 +254,35 @@ export const deletePost = async (
   res: Response,
   next: NextFunction
 ) => {
-    const postId = req.params.id;
+  const postId = req.params.id;
 
-    const post = await Post.findById(postId);
+  const post = await Post.findById(postId);
 
-    if (!post) {
-      return next(new AppError("Post not found", 404));
-    }
+  if (!post) {
+    return next(new AppError("Post not found", 404));
+  }
 
-    /**
-     * Optional but recommended:
-     * if the post belongs to a user, make sure the current user owns it
-     */
-    if (String(post.user) !== String(req.user?._id)) {
-      return next(new AppError("You are not allowed to delete this post", 403));
-    }
+  /**
+   * Optional but recommended:
+   * if the post belongs to a user, make sure the current user owns it
+   */
+  if (String(post.user) !== String(req.user?._id)) {
+    return next(new AppError("You are not allowed to delete this post", 403));
+  }
 
-    /**
-     * 1) Delete Cloudinary assets first
-     * 2) Then delete post from database
-     */
-    await deletePostMediaFromCloudinary(post.media);
+  /**
+   * 1) Delete Cloudinary assets first
+   * 2) Then delete post from database
+   */
+  await deletePostMediaFromCloudinary(post.media);
 
-    await Post.findByIdAndDelete(postId);
+  await Post.findByIdAndDelete(postId);
 
-    return sendSuccess(
-      req,
-      res,
-      { id: postId },
-      200,
-      "Post deleted successfully"
-    );
+  return sendSuccess(
+    req,
+    res,
+    { id: postId },
+    200,
+    "Post deleted successfully"
+  );
 };
