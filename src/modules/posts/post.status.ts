@@ -1,17 +1,13 @@
 import { Platform } from "../../types/type";
 
-type PostStatus = "draft" | "queued" | "publishing" | "published" | "partial" | "failed";
+type PostStatus =
+  | "draft"
+  | "queued"
+  | "publishing"
+  | "published"
+  | "partial"
+  | "failed";
 
-
-/**
- * Calculates the final post status based on per-platform publish results.
- *
- * Rules:
- * - If at least one platform succeeded:
- *     - and others failed/idle -> "partial"
- *     - and all succeeded      -> "published"
- * - If none succeeded -> "failed"
- */
 export function finalizeStatus(post: any): {
   status: PostStatus;
   publishedPlatforms: Platform[];
@@ -21,14 +17,21 @@ export function finalizeStatus(post: any): {
   const results = post.publishResults || {};
   const targets = post.targets || {};
 
-  const platforms: Platform[] = ["facebook", "instagram", "tiktok" , "youtube"];
+  const platforms: Platform[] = [
+    "facebook",
+    "instagram",
+    "tiktok",
+    "youtube",
+  ];
 
-  // Only consider platforms that were selected by the user
-  const targeted = platforms.filter((p) => targets?.[p] === true);
+  const targeted = platforms.filter(
+    (p) => targets?.[p] === true
+  );
 
   const publishedPlatforms: Platform[] = [];
   const failedPlatforms: Platform[] = [];
   const idlePlatforms: Platform[] = [];
+  const processingPlatforms: Platform[] = [];
 
   for (const p of targeted) {
     const s = results?.[p]?.status;
@@ -37,24 +40,32 @@ export function finalizeStatus(post: any): {
       publishedPlatforms.push(p);
     } else if (s === "failed") {
       failedPlatforms.push(p);
+    } else if (s === "processing") {
+      processingPlatforms.push(p);
     } else {
-      // idle or undefined
       idlePlatforms.push(p);
     }
   }
 
-  const anyPublished = publishedPlatforms.length > 0;
-
   let status: PostStatus;
 
-  if (anyPublished) {
+  if (processingPlatforms.length > 0) {
     status =
-      failedPlatforms.length > 0 || idlePlatforms.length > 0
+      publishedPlatforms.length > 0 || failedPlatforms.length > 0
         ? "partial"
-        : "published";
+        : "publishing";
+  } else if (
+    targeted.length > 0 &&
+    publishedPlatforms.length === targeted.length
+  ) {
+    status = "published";
+  } else if (publishedPlatforms.length > 0) {
+    status = "partial";
   } else {
     status = "failed";
   }
+
+  post.status = status;
 
   return {
     status,

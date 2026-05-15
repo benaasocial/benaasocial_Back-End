@@ -4,9 +4,6 @@ import AppError from "../../utils/AppError";
 import Post from "./model";
 import { sendSuccess } from "../../utils/response";
 import { ApiFeatures } from "../../utils/ApiFeatures";
-
-
-
 import {
   publishPost,
   retryPostPublishing,
@@ -15,6 +12,8 @@ import { deletePostMediaFromCloudinary } from "../../utils/DeleteFromCloudinary"
 import { ConnectedAccount } from "../integrations/ConnectedAccount";
 import { getValidTikTokAccessToken } from "./post.tiktok.token";
 import { getTikTokCreatorInfo } from "../../services/tiktokPublish/tiktokCreatorInfo";
+import { fetchTikTokPublishStatus } from "../../services/tiktokPublish/tiktokPublishStatus";
+import { finalizeStatus } from "./post.status";
 
 export const createPost = async (
   req: AuthenticatedRequest,
@@ -193,43 +192,171 @@ export const getAllPosts = async (
 
 
 
+/**
+ * Fetch TikTok creator information for the currently connected account.
+ *
+ * Used by the frontend to:
+ * - Display TikTok account details
+ * - Load dynamic privacy options
+ * - Load interaction permissions (comments, duet, stitch)
+ * - Validate TikTok publishing capabilities
+ */
 export const getTikTokCreatorInfoController = async (
   req: AuthenticatedRequest,
   res: Response,
   next: NextFunction
 ) => {
 
-    const userId = req.user?._id;
+  /**
+   * Ensure authenticated user exists
+   */
+  const userId = req.user?._id;
 
-    if (!userId) {
-      return next(new AppError("Unauthorized", 401));
-    }
+  if (!userId) {
+    return next(new AppError("Unauthorized", 401));
+  }
 
-    const account = await ConnectedAccount.findOne({
-      userId: userId,
-      platform: "tiktok",
-      isActive: true,
-    });
+  /**
+   * Find active connected TikTok account
+   */
+  const account = await ConnectedAccount.findOne({
+    userId: userId,
+    platform: "tiktok",
+    isActive: true,
+  });
+
+  if (!account) {
+    return next(new AppError("TikTok account is not connected", 404));
+  }
+
+  /**
+   * Ensure access token is valid
+   */
+  const accessToken = await getValidTikTokAccessToken({
+    userId: String(userId),
+    accountId: String(account._id),
+  });
+
+  /**
+   * Fetch creator info directly from TikTok API
+   */
+  const creatorInfo = await getTikTokCreatorInfo(accessToken);
+
+  return sendSuccess(
+    req,
+    res,
+    creatorInfo,
+    200,
+    "TikTok creator info fetched successfully"
+  );
+};
+
+/**
+ * Fetch the latest TikTok publishing status for a post.
+ *
+ * Why this exists:
+ * - TikTok publishing is asynchronous
+ * - Upload success does NOT guarantee final publish success
+ * - TikTok may still process or reject the video later
+ *
+ * This endpoint synchronizes the local publish state
+ * with TikTok's latest processing result.
+ */
+function getTikTokFailureReason(tiktokStatus: any) {
+  return (
+    tiktokStatus?.fail_reason ||
+    tiktokStatus?.error?.message ||
+    tiktokStatus?.error?.code ||
+    tiktokStatus?.status_message ||
+    tiktokStatus?.message ||
+    "TikTok processing failed"
+  );
+}
+
+export const getTikTokPostStatus = async (
+  req: AuthenticatedRequest,
+  res: Response,
+  next: NextFunction
+) => {
+  const userId = req.user?._id;
+  const postId = req.params.id;
+
+  if (!userId) {
+    return next(new AppError("Unauthorized", 401));
+  }
+
+  const post = await Post.findOne({
+    _id: postId,
+    user: userId,
+  });
+
+  if (!post) {
+    return next(new AppError("Post not found", 404));
+  }
+
+  const publishId = post.publishResults?.tiktok?.externalId;
+
+  if (!publishId) {
+    return next(new AppError("TikTok publish id not found", 400));
+  }
+
+  const account = await ConnectedAccount.findOne({
+    userId,
+    platform: "tiktok",
+  });
+
+  if (!account) {
+    return next(new AppError("TikTok account is not connected", 404));
+  }
+
+  const accessToken = await getValidTikTokAccessToken({
+    userId: String(userId),
+    accountId: String(account._id),
+  });
+
+  const tiktokStatus = await fetchTikTokPublishStatus({
+    accessToken,
+    publishId,
+  });
+
+  const status = tiktokStatus?.status;
+
+  post.publishResults = post.publishResults || {};
+  post.publishResults.tiktok = post.publishResults.tiktok || {};
+
+  if (status === "PUBLISH_COMPLETE") {
+    post.publishResults.tiktok.status = "published";
+    post.publishResults.tiktok.error = null;
+    post.publishResults.tiktok.publishedAt = new Date();
+  } else if (
+    status === "FAILED" ||
+    status === "PUBLISH_FAILED" ||
+    status === "PROCESSING_UPLOAD_FAILED"
+  ) {
+    post.publishResults.tiktok.status = "failed";
+    post.publishResults.tiktok.error = getTikTokFailureReason(tiktokStatus);
+    post.publishResults.tiktok.publishedAt = null;
+  } else {
+    post.publishResults.tiktok.status = "processing";
+  }
+
+  post.publishResults.tiktok.rawStatus = tiktokStatus;
+
+  finalizeStatus(post);
+
+  await post.save();
 
 
-    if (!account) {
-      return next(new AppError("TikTok account is not connected", 404));
-    }
-
-    const accessToken = await getValidTikTokAccessToken({
-      userId: String(userId),
-      accountId: String(account._id),
-    });
-
-    const creatorInfo = await getTikTokCreatorInfo(accessToken);
-
-    return sendSuccess(
-      req,
-      res,
-      creatorInfo,
-      200,
-      "TikTok creator info fetched successfully"
-    );
+  return sendSuccess(
+    req,
+    res,
+    {
+      post,
+      tiktokStatus,
+    },
+    200,
+    "TikTok publish status fetched successfully"
+  );
 };
 
 

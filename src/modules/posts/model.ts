@@ -77,10 +77,13 @@ const MediaSchema = new Schema<MediaDoc>(
  */
 const PlatformResultSchema = new Schema(
   {
-    // idle = not attempted yet, published = success, failed = error
+    // idle = not attempted yet
+    // processing = upload succeeded and the platform is still processing the content
+    // published = publish completed successfully
+    // failed = publishing failed
     status: {
       type: String,
-      enum: ["idle", "published", "failed"],
+      enum: ["idle", "processing", "published", "failed"],
       default: "idle",
     },
 
@@ -92,6 +95,12 @@ const PlatformResultSchema = new Schema(
 
     // When it was published successfully
     publishedAt: { type: Date, default: null },
+
+    // Raw platform status payload (used for debugging / tracking)
+    rawStatus: {
+      type: Schema.Types.Mixed,
+      default: null,
+    },
   },
   { _id: false }
 );

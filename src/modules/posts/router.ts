@@ -6,6 +6,7 @@ import {
   deletePost,
   getAllPosts,
   getTikTokCreatorInfoController,
+  getTikTokPostStatus,
   retryPublishPost,
 } from "./controller";
 import { createPostSchema, idParamSchema } from "./validation";
@@ -23,6 +24,11 @@ router.delete("/:id", validate(idParamSchema), ApiError(deletePost));
 router.get(
   "/tiktok/creator-info", ApiError(getTikTokCreatorInfoController)
 );
+router.get(
+  "/:id/tiktok/status",
+  ApiError(getTikTokPostStatus)
+);
+
 
 
 export default router;

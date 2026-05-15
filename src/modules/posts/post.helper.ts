@@ -166,21 +166,23 @@ export function parsePlatform(value: unknown): Platform | null {
 
 
 /**
- * Updates/initializes the publish result for a given platform.
+ * Updates or initializes the publishing result for a specific platform.
  *
  * Why this helper exists:
- * - Ensures publishResults object always exists
- * - Ensures each platform result has a consistent shape
- * - Allows partial updates without losing existing data
+ * - Ensures publishResults always exists before updating
+ * - Keeps a consistent result structure across all platforms
+ * - Supports partial updates without overwriting existing fields
+ * - Centralizes platform result mutations in one reusable helper
  */
 export function setPlatformResult(
   post: any,
   platform: Platform,
   patch: {
-    status?: "idle" | "failed" | "published";
+    status?: "idle" | "processing" | "failed" | "published";
     externalId?: string | null;
     error?: string | null;
     publishedAt?: Date | null;
+    rawStatus?: any;
   }
 ) {
   post.publishResults = post.publishResults || {};
@@ -191,9 +193,9 @@ export function setPlatformResult(
     externalId: patch.externalId ?? prev.externalId ?? null,
     error: patch.error ?? prev.error ?? null,
     publishedAt: patch.publishedAt ?? prev.publishedAt ?? null,
+    rawStatus: patch.rawStatus ?? prev.rawStatus ?? null,
   };
 }
-
 
 
 

@@ -4,6 +4,7 @@ import {
   ALL_PLATFORMS,
   CreatePostServiceInput,
   CreatePostServiceResult,
+  Platform,
   PostStatus,
   RetryPostServiceInput,
 } from "../../types/type";
@@ -186,6 +187,25 @@ export async function publishPost(
  *
  * Handles retrying failed / partial posts.
  */
+function getPublishResult(post: any, platform: Platform) {
+  const results = post.publishResults;
+
+  if (!results) return null;
+
+  if (typeof results.get === "function") {
+    return results.get(platform);
+  }
+
+  return results[platform];
+}
+
+function hasFailedPlatform(post: any) {
+  return ALL_PLATFORMS.some((platform) => {
+    const result = getPublishResult(post, platform);
+    return result?.status === "failed";
+  });
+}
+
 export async function retryPostPublishing(
   input: RetryPostServiceInput
 ): Promise<CreatePostServiceResult> {
@@ -198,73 +218,26 @@ export async function retryPostPublishing(
     youtubeSettings,
   } = input;
 
-  /**
-   * Auth check
-   */
   if (!requesterId) {
     throw new AppError("Unauthorized", 401);
   }
 
-  /**
-   * Load post
-   */
   const existing = await Post.findById(postId);
+
   if (!existing) {
     throw new AppError("Post not found", 404);
   }
 
-  /**
-   * Permission check:
-   * - owner can retry anything
-   * - otherwise must be post owner
-   */
   const isOwner = requesterRole === "owner";
+
   if (!isOwner && String((existing as any).user) !== String(requesterId)) {
     throw new AppError("Forbidden", 403);
   }
 
-  /**
-   * Retry allowed only for publish actions
-   */
   if ((existing as any).action !== "publish") {
     throw new AppError("This post is not a publish action", 400);
   }
 
-  /**
-   * Retry allowed only for specific statuses
-   */
-  const retryablePostStatuses: PostStatus[] = ["failed", "partial", "queued"];
-  if (!retryablePostStatuses.includes(existing.status)) {
-    throw new AppError(
-      "This post cannot be retried unless its status is queued, partial, or failed",
-      400
-    );
-  }
-
-  /**
-   * Lock the post to prevent concurrent publishing
-   */
-  const locked = await Post.findOneAndUpdate(
-    { _id: postId, status: { $ne: "publishing" } },
-    { $set: { status: "publishing" } },
-    { new: true }
-  );
-
-  if (!locked) {
-    throw new AppError("Post is currently publishing", 409);
-  }
-
-  const post: any = locked;
-
-  ensurePublishResults(post);
-  ensureValidMedia(post.media);
-
-  const media = post.media;
-  const targets = post.targets || {};
-
-  /**
-   * Optional: retry only a specific platform
-   */
   const hasRequestedPlatform =
     onlyPlatform !== undefined &&
     onlyPlatform !== null &&
@@ -277,17 +250,90 @@ export async function retryPostPublishing(
   }
 
   /**
-   * Get originally selected platforms
+   * Do not allow retry while the post is already publishing.
+   * This prevents double retry clicks while TikTok is still processing.
    */
-  const targeted = ALL_PLATFORMS.filter((p) => targets?.[p] === true);
-
-  if (targeted.length === 0) {
-    return await saveFinalized(post, "No platforms selected for this post.");
+  if ((existing as any).status === "publishing") {
+    throw new AppError(
+      "Please wait. This post is still publishing.",
+      409
+    );
   }
 
-  /**
-   * Validate requested platform is part of the original targets
-   */
+  const requestedPlatformResult = requestedPlatform
+    ? getPublishResult(existing, requestedPlatform)
+    : null;
+
+  const requestedPlatformStatus =
+    requestedPlatformResult?.status;
+
+  const retryablePostStatuses: PostStatus[] = [
+    "failed",
+    "partial",
+    "queued",
+  ];
+
+  const canRetryBecausePostStatus =
+    retryablePostStatuses.includes((existing as any).status);
+
+  const canRetryBecauseRequestedPlatformFailed =
+    requestedPlatformStatus === "failed";
+
+  const canRetryBecauseAnyPlatformFailed =
+    !requestedPlatform && hasFailedPlatform(existing);
+
+  if (
+    !canRetryBecausePostStatus &&
+    !canRetryBecauseRequestedPlatformFailed &&
+    !canRetryBecauseAnyPlatformFailed
+  ) {
+    throw new AppError(
+      "This post cannot be retried unless the post or selected platform has failed",
+      400
+    );
+  }
+
+  const locked = await Post.findOneAndUpdate(
+    {
+      _id: postId,
+      status: { $ne: "publishing" },
+    },
+    {
+      $set: {
+        status: "publishing",
+      },
+    },
+    {
+      returnDocument: "after",
+    }
+  );
+
+  if (!locked) {
+    throw new AppError(
+      "Please wait. This post is still publishing.",
+      409
+    );
+  }
+
+  const post: any = locked;
+
+  ensurePublishResults(post);
+  ensureValidMedia(post.media);
+
+  const media = post.media;
+  const targets = post.targets || {};
+
+  const targeted = ALL_PLATFORMS.filter(
+    (p) => targets?.[p] === true
+  );
+
+  if (targeted.length === 0) {
+    return await saveFinalized(
+      post,
+      "No platforms selected for this post."
+    );
+  }
+
   if (requestedPlatform && !targeted.includes(requestedPlatform)) {
     return await saveFinalized(
       post,
@@ -295,17 +341,14 @@ export async function retryPostPublishing(
     );
   }
 
-  /**
-   * Build retry candidates:
-   * - compatible with media
-   * - failed / retryable
-   */
   let candidates = targeted
     .filter((p) => isPlatformCompatible(p, media.kind))
     .filter((p) => shouldRetryPlatform(post, p));
 
   if (requestedPlatform) {
-    candidates = candidates.filter((p) => p === requestedPlatform);
+    candidates = candidates.filter(
+      (p) => p === requestedPlatform
+    );
   }
 
   if (candidates.length === 0) {
@@ -317,27 +360,26 @@ export async function retryPostPublishing(
     );
   }
 
-  /**
-   * Load active accounts for retry
-   */
-  const byPlatform = await loadActiveAccounts(String(post.user), candidates);
+  const byPlatform = await loadActiveAccounts(
+    String(post.user),
+    candidates
+  );
 
-  /**
-   * Reset platform results before retry
-   */
   for (const p of candidates) {
     setPlatformResult(post, p, {
       status: byPlatform.has(p) ? "idle" : "failed",
       externalId: null,
-      error: byPlatform.has(p) ? null : "Platform not connected/active",
+      error: byPlatform.has(p)
+        ? null
+        : "Platform not connected/active",
       publishedAt: null,
+      rawStatus: null,
     });
   }
 
-  /**
-   * Only retry platforms that are actually connected
-   */
-  const runnable = candidates.filter((p) => byPlatform.has(p));
+  const runnable = candidates.filter((p) =>
+    byPlatform.has(p)
+  );
 
   if (runnable.length === 0) {
     return await saveFinalized(
@@ -348,17 +390,11 @@ export async function retryPostPublishing(
     );
   }
 
-  /**
-   * Build message again from caption + hashtags
-   */
   const message = buildMessage(
     String(post.caption || ""),
     asStringArray(post.hashtags || [])
   );
 
-  /**
-   * Execute retry publishing
-   */
   await executePublishing({
     post,
     platforms: runnable,
