@@ -25,57 +25,114 @@ dotenv.config();
 
 /**
  * Starts the Meta OAuth flow.
- * - Generates a secure state value.
- * - Stores it temporarily in DB.
- * - Returns the Facebook OAuth URL to the frontend.
+ * - Generates a secure random state value
+ * - Stores OAuth session temporarily in DB
+ * - Returns the Facebook OAuth URL to the frontend
+ *
+ * Required scopes:
+ * - pages_show_list
+ * - pages_manage_posts
+ * - instagram_basic
+ * - instagram_content_publish
+ * - business_management
+ *
+ * business_management is important for:
+ * - accessing Business-owned Pages
+ * - retrieving Pages correctly from /me/accounts
+ * - supporting Instagram business connections
  */
 export const metaStartUrl = async (
   req: AuthenticatedRequest,
   res: Response,
   next: NextFunction
 ) => {
-  // Make sure user is authenticated
+  // Ensure authenticated user exists
   const userId = req.user?._id;
-  if (!userId) return next(new AppError("Unauthorized", 401));
 
-  // Optional platform selection (facebook or instagram)
+  if (!userId) {
+    return next(new AppError("Unauthorized", 401));
+  }
+
+  /**
+   * Optional platform selection:
+   * - facebook
+   * - instagram
+   */
   const requestedPlatform =
-    req.query.platform === "facebook" || req.query.platform === "instagram"
-      ? (req.query.platform as "facebook" | "instagram")
+    req.query.platform === "facebook" ||
+    req.query.platform === "instagram"
+      ? (req.query.platform as
+          | "facebook"
+          | "instagram")
       : undefined;
 
-  // Generate random state to prevent CSRF attacks
-  const state = crypto.randomBytes(16).toString("hex");
+  // Generate secure OAuth state
+  const state =
+    crypto.randomBytes(16).toString("hex");
 
-  // Save state in DB with expiration (10 minutes)
+  // Store temporary OAuth session
   await OAuthState.create({
     state,
     userId,
-    expiresAt: new Date(Date.now() + 10 * 60 * 1000),
+    expiresAt: new Date(
+      Date.now() + 10 * 60 * 1000
+    ),
     used: false,
     provider: "meta",
     requestedPlatform,
   });
 
-  // Ensure required environment variables exist
-  if (!process.env.META_APP_ID || !process.env.META_REDIRECT_URI) {
-    return next(new AppError("Meta config missing", 500));
+  // Validate required environment variables
+  if (
+    !process.env.META_APP_ID ||
+    !process.env.META_REDIRECT_URI
+  ) {
+    return next(
+      new AppError("Meta config missing", 500)
+    );
   }
 
-  // Build OAuth URL parameters
+  /**
+   * Build Meta OAuth URL
+   */
   const params = new URLSearchParams({
     client_id: process.env.META_APP_ID,
-    redirect_uri: process.env.META_REDIRECT_URI,
-    scope:
-      "public_profile,email,pages_show_list,pages_read_engagement,pages_manage_posts,instagram_basic,instagram_content_publish",
+
+    redirect_uri:
+      process.env.META_REDIRECT_URI,
+
+    scope: [
+      "public_profile",
+      "email",
+
+      // Required for business-owned pages
+      "business_management",
+
+      // Facebook page permissions
+      "pages_show_list",
+      "pages_read_engagement",
+      "pages_manage_posts",
+
+      // Instagram permissions
+      "instagram_basic",
+      "instagram_content_publish",
+    ].join(","),
+
     state,
+
     response_type: "code",
   });
 
-  const url = `https://www.facebook.com/v25.0/dialog/oauth?${params.toString()}`;
+  const url =
+    `https://www.facebook.com/v25.0/dialog/oauth?${params.toString()}`;
 
-  // Send the OAuth URL to frontend
-  return sendSuccess(req, res, { url }, 200);
+  // Return OAuth URL to frontend
+  return sendSuccess(
+    req,
+    res,
+    { url },
+    200
+  );
 };
 
 
@@ -148,47 +205,144 @@ export const metaCallback = async (req: Request, res: Response, next: NextFuncti
 };
 
 /**
- * Get user's Meta pages using the stored user access token.
- * Requires:
- * - authenticated user
- * - valid (not expired) OAuth state session
+ * Get user's Facebook Pages
+ * using the stored Meta user access token.
+ *
+ * Returns:
+ * - Facebook Pages
+ * - Page access tokens
+ * - Page tasks/permissions
+ * - Linked Instagram business accounts
+ *
+ * Notes:
+ * - Requires valid OAuth session
+ * - Requires business_management scope
+ * - Used before selecting a page connection
  */
 export const metaPages = async (
   req: AuthenticatedRequest,
   res: Response,
   next: NextFunction
 ) => {
-  // Ensure user is authenticated
+  // Ensure authenticated user exists
   const userId = req.user?._id;
-  if (!userId) return next(new AppError("Unauthorized", 401));
 
-  // Read OAuth state from query
-  const state = typeof req.query.state === "string" ? req.query.state : undefined;
-  if (!state) {
-    return next(new AppError("Invalid input", 400, [{ field: "state", message: "Required" }]));
+  if (!userId) {
+    return next(
+      new AppError("Unauthorized", 401)
+    );
   }
 
-  // Load the saved OAuth session (must match the same user)
-  const session = await OAuthState.findOne({ state, provider: "meta", userId });
-  if (!session) return next(new AppError("Invalid state", 400));
-  if (session.expiresAt < new Date()) return next(new AppError("State expired", 400));
+  // Read OAuth state from query
+  const state =
+    typeof req.query.state === "string"
+      ? req.query.state
+      : undefined;
 
-  // Token was stored during the callback step
-  const userAccessToken = session.meta?.userAccessToken;
-  if (!userAccessToken) return next(new AppError("Session token missing", 400));
+  if (!state) {
+    return next(
+      new AppError(
+        "Invalid input",
+        400,
+        [
+          {
+            field: "state",
+            message: "Required",
+          },
+        ]
+      )
+    );
+  }
 
-  // Fetch pages the user can manage
-  const pagesResp = await axios.get("https://graph.facebook.com/v25.0/me/accounts", {
-    params: { access_token: userAccessToken, fields: "id,name" },
-    timeout: 30_000,
-  });
+  /**
+   * Load OAuth session
+   * Must belong to the same user
+   */
+  const session =
+    await OAuthState.findOne({
+      state,
+      provider: "meta",
+      userId,
+    });
 
+  if (!session) {
+    return next(
+      new AppError("Invalid state", 400)
+    );
+  }
 
-  const pages = pagesResp.data?.data ?? [];
-  if (!Array.isArray(pages)) return next(new AppError("Invalid pages response", 400));
+  // Prevent expired sessions
+  if (session.expiresAt < new Date()) {
+    return next(
+      new AppError("State expired", 400)
+    );
+  }
 
-  // Return pages list to frontend
-  return sendSuccess(req, res, { pages }, 200);
+  /**
+   * User access token was stored
+   * during Meta callback step
+   */
+  const userAccessToken =
+    session.meta?.userAccessToken;
+
+  if (!userAccessToken) {
+    return next(
+      new AppError(
+        "Session token missing",
+        400
+      )
+    );
+  }
+
+  /**
+   * Fetch Facebook Pages
+   *
+   * Includes:
+   * - page id
+   * - page name
+   * - page access token
+   * - granted tasks
+   * - linked Instagram business account
+   */
+  const pagesResp = await axios.get(
+    "https://graph.facebook.com/v25.0/me/accounts",
+    {
+      params: {
+        access_token: userAccessToken,
+
+        fields:
+          "id,name,access_token,tasks,instagram_business_account",
+      },
+
+      timeout: 30_000,
+
+      validateStatus: (s) =>
+        s >= 200 && s < 300,
+    }
+  );
+
+  const pages =
+    pagesResp.data?.data ?? [];
+
+  if (!Array.isArray(pages)) {
+    return next(
+      new AppError(
+        "Invalid pages response",
+        400
+      )
+    );
+  }
+
+  /**
+   * Return pages to frontend
+   * for page selection step
+   */
+  return sendSuccess(
+    req,
+    res,
+    { pages },
+    200
+  );
 };
 
 
