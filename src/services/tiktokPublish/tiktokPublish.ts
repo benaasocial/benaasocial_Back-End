@@ -5,25 +5,62 @@ import path from "path";
 import crypto from "crypto";
 import AppError from "../../utils/AppError";
 
-const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB per chunk
-const MAX_VIDEO_SIZE = 500 * 1024 * 1024; // 500MB max allowed size
+const CHUNK_SIZE = 10 * 1024 * 1024; // 10MB
+const MAX_VIDEO_SIZE = 500 * 1024 * 1024; // 500MB
 
 /**
- * Helper to create a standardized AppError
+ * Cloudinary transformations used only for TikTok uploads.
+ *
+ * Why?
+ * TikTok is strict with videos. Some videos fail because of:
+ * - unsupported codec
+ * - high bitrate
+ * - variable FPS
+ * - non-MP4 format
+ *
+ * So we ask Cloudinary to deliver a safer version:
+ * - MP4
+ * - H264 video
+ * - AAC audio
+ * - 30 FPS
+ * - reasonable bitrate
+ * - progressive MP4
  */
-function createError(message: string, status: number, code: string, details?: any) {
-  return new AppError(message, status, details ? [details] : [], code);
+const TIKTOK_CLOUDINARY_TRANSFORM =
+  "f_mp4,vc_h264,ac_aac,fps_30,br_6000k,q_auto:good,fl_progressive";
+
+/**
+ * Create consistent AppError objects for this service.
+ */
+function createError(
+  message: string,
+  status: number,
+  code: string,
+  details?: any
+) {
+  return new AppError(
+    message,
+    status,
+    details ? [details] : [],
+    code
+  );
 }
 
 /**
- * Determine if a request should be retried based on HTTP status
+ * Some errors can be temporary.
+ * These statuses usually mean retry might work later.
  */
 function shouldRetry(status?: number) {
-  return status === 408 || status === 429 || (status && status >= 500);
+  return (
+    status === 408 ||
+    status === 429 ||
+    Boolean(status && status >= 500)
+  );
 }
 
 /**
- * Safely parse a fetch response (JSON or text fallback)
+ * TikTok sometimes returns JSON, sometimes plain text.
+ * This helper safely reads either.
  */
 async function parseResponse(res: Response) {
   try {
@@ -38,10 +75,54 @@ async function parseResponse(res: Response) {
 }
 
 /**
- * Download video from remote URL and store it temporarily
+ * If the video comes from Cloudinary,
+ * return a TikTok-friendly transformed URL.
+ *
+ * If it is not a Cloudinary URL, return it as-is.
+ */
+function getTikTokVideoUrl(videoUrl: string) {
+  const isCloudinaryVideo =
+    videoUrl.includes("res.cloudinary.com") &&
+    videoUrl.includes("/video/upload/");
+
+  if (!isCloudinaryVideo) {
+    return videoUrl;
+  }
+
+  return videoUrl.replace(
+    "/video/upload/",
+    `/video/upload/${TIKTOK_CLOUDINARY_TRANSFORM}/`
+  );
+}
+
+/**
+ * Delete temp file safely.
+ * Cleanup errors should not break the main flow.
+ */
+function deleteTempFile(filePath: string | null) {
+  try {
+    if (filePath && fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+  } catch {
+    // ignore cleanup errors
+  }
+}
+
+/**
+ * Download video from URL into a temporary local file.
+ *
+ * TikTok FILE_UPLOAD requires us to know:
+ * - file size
+ * - file chunks
+ *
+ * So we download the video first, then upload it to TikTok.
  */
 async function downloadVideo(videoUrl: string) {
-  const fileName = `tiktok_${Date.now()}_${crypto.randomBytes(4).toString("hex")}.mp4`;
+  const fileName = `tiktok_${Date.now()}_${crypto
+    .randomBytes(4)
+    .toString("hex")}.mp4`;
+
   const filePath = path.join(os.tmpdir(), fileName);
 
   let response;
@@ -49,9 +130,12 @@ async function downloadVideo(videoUrl: string) {
   try {
     response = await axios.get(videoUrl, {
       responseType: "stream",
-      timeout: 60000,
+      timeout: 90_000,
       maxRedirects: 5,
       validateStatus: (s) => s >= 200 && s < 300,
+      headers: {
+        Accept: "video/mp4,video/*,*/*",
+      },
     });
   } catch (error: any) {
     const status = error?.response?.status;
@@ -62,38 +146,54 @@ async function downloadVideo(videoUrl: string) {
       "TIKTOK_VIDEO_DOWNLOAD_FAILED",
       {
         step: "download",
+        videoUrl,
         httpStatus: status,
         axiosCode: error?.code,
-        response: error?.response?.data,
       }
     );
   }
 
   /**
-   * Stream video into a temp file while checking max size
+   * Write remote stream into temp file.
+   * While writing, make sure video does not exceed our max limit.
    */
   await new Promise<void>((resolve, reject) => {
     const writer = fs.createWriteStream(filePath);
-    let total = 0;
+    let totalSize = 0;
+    let finished = false;
+
+    const fail = (error: Error) => {
+      if (finished) return;
+
+      finished = true;
+
+      response.data.destroy(error);
+      writer.destroy(error);
+
+      reject(error);
+    };
 
     response.data.on("data", (chunk: Buffer) => {
-      total += chunk.length;
+      totalSize += chunk.length;
 
-      if (total > MAX_VIDEO_SIZE) {
-        response.data.destroy(new Error("VIDEO_TOO_LARGE"));
-        writer.destroy(new Error("VIDEO_TOO_LARGE"));
+      if (totalSize > MAX_VIDEO_SIZE) {
+        fail(new Error("VIDEO_TOO_LARGE"));
       }
     });
 
-    response.data.pipe(writer);
+    response.data.on("error", fail);
+    writer.on("error", fail);
 
-    writer.on("finish", resolve);
-    writer.on("error", reject);
-    response.data.on("error", reject);
-  }).catch((e) => {
-    try {
-      if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    } catch { }
+    writer.on("finish", () => {
+      if (finished) return;
+
+      finished = true;
+      resolve();
+    });
+
+    response.data.pipe(writer);
+  }).catch((error) => {
+    deleteTempFile(filePath);
 
     throw createError(
       "Failed while downloading video stream",
@@ -101,41 +201,63 @@ async function downloadVideo(videoUrl: string) {
       "TIKTOK_VIDEO_DOWNLOAD_STREAM_FAILED",
       {
         step: "download",
-        errorMessage: e?.message,
+        videoUrl,
+        errorMessage: error?.message,
       }
     );
   });
 
   const stats = fs.statSync(filePath);
 
-  /**
-   * Validate downloaded file is not empty
-   */
   if (!stats.size) {
-    fs.unlinkSync(filePath);
+    deleteTempFile(filePath);
 
     throw createError(
       "Downloaded video is empty",
       400,
       "TIKTOK_VIDEO_EMPTY",
-      { step: "download" }
+      {
+        step: "download",
+        videoUrl,
+      }
     );
   }
 
-  return { filePath, fileSize: stats.size };
+  return {
+    filePath,
+    fileSize: stats.size,
+  };
 }
 
 /**
- * Read a chunk from file using file descriptor
+ * Read part of the file for chunk upload.
  */
-async function readChunk(fd: fs.promises.FileHandle, start: number, length: number) {
+async function readChunk(
+  fileHandle: fs.promises.FileHandle,
+  start: number,
+  length: number
+) {
   const buffer = Buffer.alloc(length);
-  const { bytesRead } = await fd.read(buffer, 0, length, start);
+
+  const { bytesRead } = await fileHandle.read(
+    buffer,
+    0,
+    length,
+    start
+  );
+
   return buffer.subarray(0, bytesRead);
 }
 
 /**
- * Main TikTok publishing function
+ * Publish video to TikTok using FILE_UPLOAD.
+ *
+ * Flow:
+ * 1. Make Cloudinary URL TikTok-friendly
+ * 2. Download video locally
+ * 3. Initialize TikTok upload
+ * 4. Upload video chunks
+ * 5. Return publish_id for status polling
  */
 export async function publishTikTokVideo({
   accessToken,
@@ -151,27 +273,16 @@ export async function publishTikTokVideo({
   videoUrl: string;
   caption: string;
 
-  /**
-   * TikTok privacy level selected from the frontend.
-   * If not provided, backend will fallback to SELF_ONLY.
-   */
   privacy_level?:
-  | "PUBLIC_TO_EVERYONE"
-  | "MUTUAL_FOLLOW_FRIENDS"
-  | "FOLLOWER_OF_CREATOR"
-  | "SELF_ONLY";
+    | "PUBLIC_TO_EVERYONE"
+    | "MUTUAL_FOLLOW_FRIENDS"
+    | "FOLLOWER_OF_CREATOR"
+    | "SELF_ONLY";
 
-  /**
-   * TikTok interaction settings selected from the frontend.
-   */
   disable_comment?: boolean;
   disable_duet?: boolean;
   disable_stitch?: boolean;
 
-  /**
-   * Backend safety override.
-   * If true, privacy will always be SELF_ONLY regardless of frontend value.
-   */
   forcePrivate?: boolean;
 }) {
   let filePath: string | null = null;
@@ -179,35 +290,47 @@ export async function publishTikTokVideo({
 
   try {
     /**
-     * Step 1: Download video locally.
+     * Step 1:
+     * Convert Cloudinary video URL into a safer TikTok version.
+     *
+     * If the video is not from Cloudinary, this returns the original URL.
      */
-    const { filePath: tempPath, fileSize } = await downloadVideo(videoUrl);
-    filePath = tempPath;
+    const tiktokVideoUrl = getTikTokVideoUrl(videoUrl);
 
     /**
-     * Step 2: Calculate chunking strategy.
+     * Step 2:
+     * Download the video locally so we can calculate size and upload chunks.
      */
-    const chunkSize = fileSize <= 5 * 1024 * 1024 ? fileSize : CHUNK_SIZE;
+    const downloaded = await downloadVideo(tiktokVideoUrl);
+
+    filePath = downloaded.filePath;
+    const fileSize = downloaded.fileSize;
+
+    /**
+     * Step 3:
+     * Decide chunk size.
+     *
+     * Small videos upload in one chunk.
+     * Bigger videos upload in 10MB chunks.
+     */
+    const chunkSize =
+      fileSize <= 5 * 1024 * 1024
+        ? fileSize
+        : CHUNK_SIZE;
+
     const totalChunks = Math.ceil(fileSize / chunkSize);
 
     /**
-     * TikTok privacy handling.
-     * - If forcePrivate is true, force SELF_ONLY.
-     * - Otherwise, use the value selected from the frontend.
-     * - If frontend did not send privacy_level, fallback to SELF_ONLY.
+     * Step 4:
+     * Prepare TikTok publish settings.
      */
-    const privacy = forcePrivate ? "SELF_ONLY" : privacy_level ?? "SELF_ONLY";
+    const privacy = forcePrivate
+      ? "SELF_ONLY"
+      : privacy_level ?? "SELF_ONLY";
 
     /**
-     * TikTok interaction settings.
-     * These values come from the frontend.
-     */
-    const allowCommentDisabled = Boolean(disable_comment);
-    const allowDuetDisabled = Boolean(disable_duet);
-    const allowStitchDisabled = Boolean(disable_stitch);
-
-    /**
-     * Step 3: Initialize TikTok upload session.
+     * Step 5:
+     * Ask TikTok to create an upload session.
      */
     const initRes = await fetch(
       "https://open.tiktokapis.com/v2/post/publish/video/init/",
@@ -221,9 +344,9 @@ export async function publishTikTokVideo({
           post_info: {
             title: (caption || "").trim().slice(0, 2200),
             privacy_level: privacy,
-            disable_comment: allowCommentDisabled,
-            disable_duet: allowDuetDisabled,
-            disable_stitch: allowStitchDisabled,
+            disable_comment: Boolean(disable_comment),
+            disable_duet: Boolean(disable_duet),
+            disable_stitch: Boolean(disable_stitch),
           },
           source_info: {
             source: "FILE_UPLOAD",
@@ -246,6 +369,13 @@ export async function publishTikTokVideo({
           step: "init",
           httpStatus: initRes.status,
           response: initBody,
+          video: {
+            originalUrl: videoUrl,
+            uploadedUrl: tiktokVideoUrl,
+            fileSize,
+            chunkSize,
+            totalChunks,
+          },
         }
       );
     }
@@ -266,17 +396,22 @@ export async function publishTikTokVideo({
     }
 
     /**
-     * Step 4: Upload video in chunks.
+     * Step 6:
+     * Upload file chunks to TikTok.
      */
     fileHandle = await fs.promises.open(filePath, "r");
 
-    for (let i = 0; i < totalChunks; i++) {
-      const start = i * chunkSize;
+    for (let index = 0; index < totalChunks; index++) {
+      const start = index * chunkSize;
       const endExclusive = Math.min(start + chunkSize, fileSize);
       const end = endExclusive - 1;
       const length = endExclusive - start;
 
-      const chunk = await readChunk(fileHandle, start, length);
+      const chunk = await readChunk(
+        fileHandle,
+        start,
+        length
+      );
 
       const uploadRes = await fetch(uploadUrl, {
         method: "PUT",
@@ -288,8 +423,16 @@ export async function publishTikTokVideo({
         body: chunk,
       });
 
-      if (uploadRes.status !== 206 && uploadRes.status !== 201) {
-        const body = await parseResponse(uploadRes);
+      /**
+       * TikTok returns:
+       * - 206 while receiving chunks
+       * - 201 when upload is complete
+       */
+      if (
+        uploadRes.status !== 206 &&
+        uploadRes.status !== 201
+      ) {
+        const uploadBody = await parseResponse(uploadRes);
 
         throw createError(
           "TikTok chunk upload failed",
@@ -299,41 +442,50 @@ export async function publishTikTokVideo({
             step: "upload",
             httpStatus: uploadRes.status,
             chunk: {
-              index: i,
+              index,
               total: totalChunks,
               start,
               end,
               size: chunk.length,
             },
-            response: body,
+            response: uploadBody,
           }
         );
       }
     }
 
     /**
-     * Return publish id.
-     * Used later to track TikTok publishing status.
+     * TikTok publishing is async.
+     * This publish_id is used later to check final status.
      */
-    return { publish_id: publishId };
+    return {
+      publish_id: publishId,
+    };
   } catch (error: any) {
-    if (error instanceof AppError) throw error;
+    if (error instanceof AppError) {
+      throw error;
+    }
 
-    throw createError("TikTok upload failed", 502, "TIKTOK_UNEXPECTED", {
-      errorMessage: error?.message,
-    });
+    throw createError(
+      "TikTok upload failed",
+      502,
+      "TIKTOK_UNEXPECTED",
+      {
+        errorMessage: error?.message,
+      }
+    );
   } finally {
     /**
-     * Cleanup resources:
-     * - Close file handle.
-     * - Delete temp file.
+     * Always cleanup temp resources.
      */
     try {
-      if (fileHandle) await fileHandle.close();
-    } catch { }
+      if (fileHandle) {
+        await fileHandle.close();
+      }
+    } catch {
+      // ignore cleanup errors
+    }
 
-    try {
-      if (filePath && fs.existsSync(filePath)) fs.unlinkSync(filePath);
-    } catch { }
+    deleteTempFile(filePath);
   }
 }
