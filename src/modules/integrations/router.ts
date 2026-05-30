@@ -26,7 +26,7 @@ router.get("/meta/start", authenticate, ApiError(metaStartUrl));
 router.get("/meta/callback", ApiError(metaCallback));
 
 router.get("/meta/pages", authenticate, ApiError(metaPages));
-router.post("/meta/select-page", authenticate, metaSelectPage);
+router.post("/meta/select-page", authenticate, ApiError(metaSelectPage));
 
 /**
  * TikTok OAuth flow

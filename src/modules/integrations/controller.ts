@@ -54,29 +54,38 @@ export const metaStartUrl = async (
   }
 
   /**
-   * Optional platform selection:
-   * - facebook
-   * - instagram
+   * Optional platform selection.
+   *
+   * Used to know whether the user started the flow for:
+   * - Facebook
+   * - Instagram
+   *
+   * This is saved in OAuthState and used later after page selection.
    */
   const requestedPlatform =
     req.query.platform === "facebook" ||
     req.query.platform === "instagram"
-      ? (req.query.platform as
-          | "facebook"
-          | "instagram")
+      ? (req.query.platform as "facebook" | "instagram")
       : undefined;
 
-  // Generate secure OAuth state
-  const state =
-    crypto.randomBytes(16).toString("hex");
+  /**
+   * Generate secure state value.
+   *
+   * This protects the OAuth flow from CSRF attacks and lets us
+   * match the callback request with the original logged-in user.
+   */
+  const state = crypto.randomBytes(16).toString("hex");
 
-  // Store temporary OAuth session
+  /**
+   * Store temporary OAuth session.
+   *
+   * The callback will use this state later to validate the request.
+   * The session expires after 10 minutes.
+   */
   await OAuthState.create({
     state,
     userId,
-    expiresAt: new Date(
-      Date.now() + 10 * 60 * 1000
-    ),
+    expiresAt: new Date(Date.now() + 10 * 60 * 1000),
     used: false,
     provider: "meta",
     requestedPlatform,
@@ -87,52 +96,45 @@ export const metaStartUrl = async (
     !process.env.META_APP_ID ||
     !process.env.META_REDIRECT_URI
   ) {
-    return next(
-      new AppError("Meta config missing", 500)
-    );
+    return next(new AppError("Meta config missing", 500));
   }
 
   /**
-   * Build Meta OAuth URL
+   * Build Meta OAuth URL.
+   *
+   * Important:
+   * - `business_management` is required for business-owned pages.
+   * - `auth_type=reauthenticate` helps with account switching.
    */
   const params = new URLSearchParams({
     client_id: process.env.META_APP_ID,
+    redirect_uri: process.env.META_REDIRECT_URI,
+    response_type: "code",
+    state,
 
-    redirect_uri:
-      process.env.META_REDIRECT_URI,
 
     scope: [
       "public_profile",
       "email",
 
-      // Required for business-owned pages
+      // Required for business-owned Facebook Pages
       "business_management",
 
-      // Facebook page permissions
+      // Facebook Page permissions
       "pages_show_list",
       "pages_read_engagement",
       "pages_manage_posts",
 
-      // Instagram permissions
+      // Instagram Business permissions
       "instagram_basic",
       "instagram_content_publish",
     ].join(","),
-
-    state,
-
-    response_type: "code",
   });
 
-  const url =
-    `https://www.facebook.com/v25.0/dialog/oauth?${params.toString()}`;
+  const url = `https://www.facebook.com/v25.0/dialog/oauth?${params.toString()}`;
 
   // Return OAuth URL to frontend
-  return sendSuccess(
-    req,
-    res,
-    { url },
-    200
-  );
+  return sendSuccess(req, res, { url }, 200);
 };
 
 
@@ -145,38 +147,137 @@ export const metaStartUrl = async (
  * - Stores token in the OAuthState session
  * - Redirects to frontend to continue the flow
  */
-export const metaCallback = async (req: Request, res: Response, next: NextFunction) => {
-  try {
-    // Read code/state from query
-    const code = typeof req.query.code === "string" ? req.query.code : undefined;
-    const state = typeof req.query.state === "string" ? req.query.state : undefined;
+export const metaCallback = async (
+  req: Request,
+  res: Response,
+  next: NextFunction
+) => {
+  // Read Meta OAuth success params
+  const code =
+    typeof req.query.code === "string"
+      ? req.query.code
+      : undefined;
 
-    if (!code || !state) return next(new AppError("Missing code/state", 400));
+  const state =
+    typeof req.query.state === "string"
+      ? req.query.state
+      : undefined;
 
-    // Validate required env vars
-    const { META_APP_ID, META_APP_SECRET, META_REDIRECT_URI, FRONTEND_URL } = process.env;
-    if (!META_APP_ID || !META_APP_SECRET || !META_REDIRECT_URI || !FRONTEND_URL) {
-      return next(new AppError("Meta config missing", 500));
-    }
+  // Read Meta OAuth cancel/error params
+  const error =
+    typeof req.query.error === "string"
+      ? req.query.error
+      : undefined;
 
-    // Load state session from DB
-    const session = await OAuthState.findOne({ state, provider: "meta" });
-    if (!session) return next(new AppError("Invalid state", 400));
-    if (session.used) return next(new AppError("State already used", 400));
-    if (session.expiresAt < new Date()) return next(new AppError("State expired", 400));
+  const errorReason =
+    typeof req.query.error_reason === "string"
+      ? req.query.error_reason
+      : undefined;
 
-    // 1) Exchange code -> short-lived user token
-    const tokenResp = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", {
-      params: { client_id: META_APP_ID, client_secret: META_APP_SECRET, redirect_uri: META_REDIRECT_URI, code },
+  const errorDescription =
+    typeof req.query.error_description === "string"
+      ? req.query.error_description
+      : undefined;
+
+  // Validate required env vars
+  const {
+    META_APP_ID,
+    META_APP_SECRET,
+    META_REDIRECT_URI,
+    FRONTEND_URL,
+  } = process.env;
+
+  if (
+    !META_APP_ID ||
+    !META_APP_SECRET ||
+    !META_REDIRECT_URI ||
+    !FRONTEND_URL
+  ) {
+    return next(
+      new AppError("Meta config missing", 500)
+    );
+  }
+
+  /**
+   * User cancelled Meta OAuth.
+   *
+   * This happens when the user clicks:
+   * - Not now
+   * - Cancel
+   * - closes the Meta dialog
+   *
+   * This is not a backend error.
+   * Just redirect the user back to the connect page.
+   */
+  if (error || errorReason || errorDescription) {
+    return res.redirect(
+      `${FRONTEND_URL}/dashboard/connect`
+    );
+  }
+
+  /**
+   * If Meta did not return code/state,
+   * treat it as cancelled and return to connect page.
+   */
+  if (!code || !state) {
+    return res.redirect(
+      `${FRONTEND_URL}/dashboard/connect`
+    );
+  }
+
+  // Load state session from DB
+  const session = await OAuthState.findOne({
+    state,
+    provider: "meta",
+  });
+
+  if (!session) {
+    return next(new AppError("Invalid state", 400));
+  }
+
+  if (session.used) {
+    return next(new AppError("State already used", 400));
+  }
+
+  if (session.expiresAt < new Date()) {
+    return next(new AppError("State expired", 400));
+  }
+
+  /**
+   * Step 1:
+   * Exchange authorization code for short-lived user token.
+   */
+  const tokenResp = await axios.get(
+    "https://graph.facebook.com/v25.0/oauth/access_token",
+    {
+      params: {
+        client_id: META_APP_ID,
+        client_secret: META_APP_SECRET,
+        redirect_uri: META_REDIRECT_URI,
+        code,
+      },
       timeout: 30_000,
       validateStatus: (s) => s >= 200 && s < 300,
-    });
+    }
+  );
 
-    const shortUserAccessToken: string | undefined = tokenResp.data?.access_token;
-    if (!shortUserAccessToken) return next(new AppError("Failed to get access token", 400));
+  const shortUserAccessToken:
+    | string
+    | undefined = tokenResp.data?.access_token;
 
-    // 2) Exchange short-lived -> long-lived token (recommended by Meta)
-    const longResp = await axios.get("https://graph.facebook.com/v25.0/oauth/access_token", {
+  if (!shortUserAccessToken) {
+    return next(
+      new AppError("Failed to get access token", 400)
+    );
+  }
+
+  /**
+   * Step 2:
+   * Exchange short-lived token for long-lived user token.
+   */
+  const longResp = await axios.get(
+    "https://graph.facebook.com/v25.0/oauth/access_token",
+    {
       params: {
         grant_type: "fb_exchange_token",
         client_id: META_APP_ID,
@@ -185,23 +286,42 @@ export const metaCallback = async (req: Request, res: Response, next: NextFuncti
       },
       timeout: 30_000,
       validateStatus: (s) => s >= 200 && s < 300,
-    });
+    }
+  );
 
-    const longLivedUserAccessToken: string | undefined = longResp.data?.access_token;
-    if (!longLivedUserAccessToken) return next(new AppError("Failed to get long-lived access token", 400));
+  const longLivedUserAccessToken:
+    | string
+    | undefined = longResp.data?.access_token;
 
-    // Mark session as used and store token for next steps (pages selection)
-    session.used = true;
-    session.meta = { ...(session.meta || {}), userAccessToken: longLivedUserAccessToken };
-    await session.save();
-
-    // Redirect frontend to continue the connection flow
-    return res.redirect(`${FRONTEND_URL}/dashboard/connect?state=${state}&platform=meta`);
-  } catch (e: any) {
-    // Try to show a readable Meta error (if present)
-    const fbMsg = e?.response?.data?.error?.message;
-    return next(new AppError(fbMsg || e?.message || "Meta callback failed", 400));
+  if (!longLivedUserAccessToken) {
+    return next(
+      new AppError(
+        "Failed to get long-lived access token",
+        400
+      )
+    );
   }
+
+  /**
+   * Store token in OAuth session.
+   *
+   * The frontend will call metaPages with this same state
+   * to list pages and continue the connection flow.
+   */
+  session.used = true;
+  session.meta = {
+    ...(session.meta || {}),
+    userAccessToken: longLivedUserAccessToken,
+  };
+
+  await session.save();
+
+  /**
+   * Redirect frontend to continue page selection flow.
+   */
+  return res.redirect(
+    `${FRONTEND_URL}/dashboard/connect?state=${state}&platform=meta`
+  );
 };
 
 /**
@@ -555,6 +675,7 @@ export const tiktokStartUrl = async (
     state,
     code_challenge: codeChallenge,
     code_challenge_method: "S256",
+    prompt: "select_account",
   });
 
   const url = `https://www.tiktok.com/v2/auth/authorize/?${params.toString()}`;
